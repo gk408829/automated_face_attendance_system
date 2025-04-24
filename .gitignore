@@ -1,0 +1,25 @@
+# Ignore compiled files
+*.class
+*.exe
+*.o
+
+# Ignore dependency directories
+node_modules/
+vendor/
+
+# Ignore IDE-specific files
+.idea/
+.vscode/
+.windsurf/
+
+# Ignore logs
+*.log
+logs/
+
+# Ignore environment files (sensitive data)
+.env
+*.env
+
+# Ignore OS-generated files
+.DS_Store
+Thumbs.db
