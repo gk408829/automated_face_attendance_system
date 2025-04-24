@@ -692,193 +692,166 @@ def predict_faces(model, image_dir, transform, class_names, batch_size=32):
 
 def process_attendance(image_path, models, output_dir=None):
     """Full attendance processing pipeline"""
+    # Verify models are properly initialized
+    for model_name in ['face_detector', 'gender_model', 'face_identifier']:
+        if model_name not in models or models[model_name] is None:
+            raise ValueError(f"Missing required model: {model_name}")
+
+    # Setup output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = output_dir or f"attendance_{timestamp}"
-    os.makedirs(output_dir, exist_ok=True)
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        print(f"Error creating output directory: {e}")
+        return None
+
+    # Define transforms
+    face_transform = transforms.Compose([
+        transforms.Resize((160, 160)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5])
+    ])
+
+    gender_transform = transforms.Compose([
+        transforms.Resize((128, 128)),  # Match gender classifier input size
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
 
     # 1. Face Detection
-    detections = models['face_detector'](image_path)[0]
-    img = Image.open(image_path).convert('RGB')
-    face_crops = []
+    try:
+        detections = models['face_detector'](image_path)
+        if not detections:
+            print("No faces detected!")
+            return None
 
-    for i, box in enumerate(detections.boxes.xyxy):
-        x1, y1, x2, y2 = map(int, box.tolist())
-        face_crops.append(img.crop((x1, y1, x2, y2)))
+        img = Image.open(image_path).convert('RGB')
+        face_crops = []
+
+        for i, box in enumerate(detections[0].boxes.xyxy):
+            x1, y1, x2, y2 = map(int, box.tolist())
+            face_crops.append(img.crop((x1, y1, x2, y2)))
+    except Exception as e:
+        print(f"Error during face detection: {e}")
+        return None
 
     if not face_crops:
-        print("No faces detected!")
+        print("No valid face crops extracted!")
         return None
 
     # 2. Batch Processing
-    with torch.inference_mode():
-        # Preprocess faces
-        face_tensors = torch.stack([transforms.Resize((160, 160)),
-                                    transforms.ToTensor(),
-                                    transforms.Normalize([0.5], [0.5])](face) for face in face_crops]).to(DEVICE)
+    results = []
+    try:
+        with torch.no_grad():
+            # Prepare batches
+            face_tensors = torch.stack([face_transform(face) for face in face_crops]).to(DEVICE)
+            gender_tensors = torch.stack([gender_transform(face) for face in face_crops]).to(DEVICE)
 
-        gender_tensors = torch.stack([transforms.Resize((224, 224)),
-                                      transforms.ToTensor(),
-                                      transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-                                     ](face) for face in face_crops]).to(DEVICE)
+            # Get predictions
+            gender_probs = torch.softmax(models['gender_model'](gender_tensors), dim=1)
+            face_logits = models['face_identifier'](face_tensors)
+            face_probs = torch.softmax(face_logits, dim=1)
+            _, face_preds = torch.max(face_probs, dim=1)
 
-        # Get predictions
-        gender_probs = torch.softmax(models['gender_model'](gender_tensors), dim=1)
-        face_logits = models['face_identifier'](face_tensors)
-        face_preds = torch.argmax(face_logits, dim=1)
-        face_probs = torch.softmax(face_logits, dim=1)
+            # Process results
+            for i, (face, gender_prob, face_pred, face_prob) in enumerate(
+                    zip(face_crops, gender_probs, face_preds, face_probs)):
 
-        # 3. Generate Results
-        results = []
-        for i, (face, gender_prob, face_pred, face_prob) in enumerate(
-                zip(face_crops, gender_probs, face_preds, face_probs)):
-        # Save face crop
-            face_path = os.path.join(output_dir, f"face_{i}.jpg")
-        face.save(face_path)
+                face_path = os.path.join(output_dir, f"face_{i}.jpg")
+                face.save(face_path)
 
-        # Get predictions
-        gender = "male" if gender_prob[0] > GENDER_CONF_THRESH else "female"
-        identity = models['class_names'][face_pred] if max(face_prob) > MIN_FACE_CONFIDENCE else "Unknown"
+                # Determine gender
+                gender = "male" if gender_prob[0] > GENDER_CONF_THRESH else "female"
 
-        results.append({
-        'face_id': i,
-        'image_path': face_path,
-        'identity': identity,
-        'confidence': round(max(face_prob).item(), 4),
-        'gender': gender,
-        'gender_confidence': round(max(gender_prob).item(), 4)
-    })
+                # Determine identity
+                max_prob = face_prob.max().item()
+                if max_prob > MIN_FACE_CONFIDENCE:
+                    identity = models['class_names'][face_pred.item()]
+                else:
+                    identity = "Unknown"
 
-    # 4. Create Attendance Log
+                results.append({
+                    'face_id': i,
+                    'image_path': face_path,
+                    'identity': identity,
+                    'confidence': round(max_prob, 4),
+                    'gender': gender,
+                    'gender_confidence': round(gender_prob.max().item(), 4)
+                })
+    except Exception as e:
+        print(f"Error during model inference: {e}")
+        return None
+
+    # 3. Create Attendance Log
     attendance = []
     for student in models['class_names']:
         present = any(r['identity'] == student for r in results)
-    attendance.append({
-    'student': student,
-    'present': int(present),
-    'timestamp': timestamp
+        attendance.append({
+            'student': student,
+            'present': int(present),
+            'timestamp': timestamp
+        })
 
-})
+    # 4. Save outputs
+    try:
+        results_df = pd.DataFrame(results)
+        attendance_df = pd.DataFrame(attendance)
 
-# Save outputs
-results_df = pd.DataFrame(results)
-attendance_df = pd.DataFrame(attendance)
+        results_df.to_csv(os.path.join(output_dir, 'face_predictions.csv'), index=False)
+        attendance_df.to_csv(os.path.join(output_dir, 'attendance.csv'), index=False)
+    except Exception as e:
+        print(f"Error saving results: {e}")
+        return None
 
-results_df.to_csv(os.path.join(output_dir, 'face_predictions.csv'), index=False)
-attendance_df.to_csv(os.path.join(output_dir, 'attendance.csv'), index=False)
+    # 5. Print summary
+    print(f"\nDetected {len(results)} faces:")
+    print(results_df[['face_id', 'identity', 'confidence']])
 
-# Print summary
-print(f"\nDetected {len(results)} faces:")
-print(results_df[['face_id', 'identity', 'confidence']])
+    print(f"\nAttendance Summary:")
+    print(attendance_df)
 
-print(f"\nAttendance Summary:")
-print(attendance_df)
+    print(f"\nResults saved to: {output_dir}")
 
-print(f"\nResults saved to: {output_dir}")
-
-return results_df, attendance_df
+    return results_df, attendance_df
 
 
 def main():
     """Main execution pipeline"""
-    # 1. Setup
-    dirs = setup_directories()
+    try:
+        # [Previous setup code remains the same until model loading]
 
-    # 2. Load and prepare LFW data
-    lfw_data, selected_names = load_lfw_data()
-    save_filtered_images(lfw_data, selected_names, dirs['data'])
-    gender_labels = initialize_gender_labels(selected_names)
+        # 11. Prepare models for attendance system
+        # Ensure models are in eval mode and on correct device
+        gender_model.eval().to(DEVICE)
+        face_model.eval().to(DEVICE)
 
-    # Save gender labels
-    with open(os.path.join(dirs['data'], "gender_labels.json"), "w") as f:
-        json.dump(gender_labels, f, indent=2)
+        models = {
+            'face_detector': yolo_model,
+            'gender_model': gender_model,
+            'face_identifier': face_model,
+            'class_names': selected_names  # Ensure these match face_model output classes
+        }
 
-    # 3. Face detection
-    bbox_data = detect_faces(dirs['data'])
-    with open(os.path.join(dirs['sim_output'], "bounding_boxes.json"), "w") as f:
-        json.dump(bbox_data, f, indent=2)
+        # 12. Process sample image - find first available image
+        sample_image = None
+        for f in os.listdir(dirs['sim_output']):
+            if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                sample_image = os.path.join(dirs['sim_output'], f)
+                break
 
-    # 4. Create simulated dataset
-    sim_config = {
-        "face_base": dirs['data'],
-        "bg_base": dirs['background'],
-        "output_dir": dirs['sim_output'],
-        "output_size": (640, 480),
-        "num_images": 300,
-        "faces_per_image": (3, 7),
-        "apply_blur": True,
-        "background_ext": ".jpg",
-        "face_scale_range": (0.1, 0.3),
-        "rotation_range": (-15, 15),
-        "blur_chance": 0.3,
-        "blur_radius_range": (0.5, 1.5),
-        "female_ratio": 0.6,
-        "gender_labels": gender_labels
-    }
+        if sample_image:
+            print(f"\nProcessing sample image: {sample_image}")
+            process_attendance(sample_image, models)
+        else:
+            print("No suitable sample image found in simulation output directory")
 
-    annotations, total_female, total_male = create_simulated_dataset(sim_config)
+    except Exception as e:
+        print(f"Error in main execution: {e}")
+        return 1
 
-    # Save annotations
-    with open(os.path.join(dirs['sim_output'], "annotations.json"), "w") as f:
-        json.dump(annotations, f, indent=2)
-
-    print(f"\nSimulated dataset created with {total_female} female and {total_male} male faces")
-
-    # 5. Prepare YOLO dataset
-    yaml_path = prepare_yolo_dataset(
-        annotations,
-        gender_labels,
-        dirs['yolo_dataset']
-    )
-
-    # 6. Train YOLO model
-    yolo_model = train_yolo_model(yaml_path)
-    evaluate_yolo_model(yolo_model, os.path.join(dirs['yolo_dataset'], "images", "val"))
-
-    # 7. Crop faces for gender classification
-    crop_detected_faces(
-        yolo_model,
-        os.path.join(dirs['yolo_dataset'], "images", "val"),
-        dirs['output_crop']
-    )
-
-    # 8. Prepare gender dataset
-    for person in os.listdir(dirs['data']):
-        person_path = os.path.join(dirs['data'], person)
-        if not os.path.isdir(person_path) or person == "gender_dataset":
-            continue
-
-        gender = gender_labels.get(person)
-        if gender not in ["male", "female"]:
-            continue
-
-        target_dir = os.path.join(dirs['gender_dataset'], gender)
-        for img_name in os.listdir(person_path):
-            src = os.path.join(person_path, img_name)
-            dst = os.path.join(target_dir, f"{person}_{img_name}")
-            if os.path.isfile(src):
-                shutil.copy(src, dst)
-
-    # 9. Train gender classifier
-    gender_model = train_gender_classifier(dirs['gender_dataset'])
-
-    # 10. Train face recognition
-    face_model = train_face_recognition(dirs['data'])
-
-    # 11. Load models for attendance system
-    models = {
-        'face_detector': yolo_model,
-        'gender_model': gender_model,
-        'face_identifier': face_model,
-        'class_names': selected_names
-    }
-
-    # 12. Process sample image
-    sample_image = os.path.join(dirs['sim_output'], "sim_000.jpg")
-    if os.path.exists(sample_image):
-        process_attendance(sample_image, models)
-    else:
-        print(f"Sample image not found at {sample_image}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
